@@ -22,7 +22,6 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
@@ -32,6 +31,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -39,6 +39,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -62,6 +63,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -125,6 +127,40 @@ class MiniMaxM2RMSNormTP(nn.Module):
         return x
 
 
+class MiniMaxM2MLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "mlp",
+    ) -> None:
+        super().__init__()
+
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
+        )
+        self.act_fn = SiluAndMul()
+        return
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
 class MiniMaxM2MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
 
@@ -167,6 +203,9 @@ class MiniMaxM2MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=True,
             scoring_func=config.scoring_func,
+            use_grouped_topk=True,  # TODO: Use "grouped top-k" flag only for hardcoded sigmoid scoring
+            num_expert_group=1,
+            topk_group=1,
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=1.0,
         )
@@ -219,7 +258,7 @@ class MiniMaxM2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states.to(torch.float32))
-            topk_output = self.topk(
+            topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
@@ -228,10 +267,14 @@ class MiniMaxM2MoE(nn.Module):
                 ),
             )
         else:
-            topk_output = self.topk.empty_topk_output(device=hidden_states.device)
+            topk_weights, topk_idx, _ = self.topk.empty_topk_output(
+                hidden_states.shape[0], self.top_k
+            )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            topk_output=topk_output,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            forward_batch=forward_batch,
         )
 
         return final_hidden_states
@@ -516,13 +559,11 @@ class MiniMaxM2DecoderLayer(nn.Module):
         )
 
         is_previous_layer_sparse = True
-        is_next_layer_sparse = True
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.layer_communicator = LayerCommunicator(

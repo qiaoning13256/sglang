@@ -19,12 +19,14 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import hashlib
 import json
 import os
-from functools import reduce
+import tempfile
 from pathlib import Path
 from typing import Any, Optional, cast
 
+import filelock
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
@@ -32,7 +34,6 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_other_loggers,
@@ -59,27 +60,24 @@ def download_from_hf(model_path: str):
 
 
 def get_hf_config(
-    component_model_path: str,
+    model: str,
     trust_remote_code: bool,
     revision: str | None = None,
     model_override_args: dict | None = None,
     **kwargs,
-) -> PretrainedConfig:
-    is_gguf = check_gguf_file(component_model_path)
+):
+    is_gguf = check_gguf_file(model)
     if is_gguf:
         raise NotImplementedError("GGUF models are not supported.")
 
     config = AutoConfig.from_pretrained(
-        component_model_path,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        **kwargs,
+        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
-        config = config_class.from_pretrained(component_model_path, revision=revision)
+        config = config_class.from_pretrained(model, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
-        config._name_or_path = component_model_path
+        config._name_or_path = model
     if model_override_args:
         config.update(model_override_args)
 
@@ -127,39 +125,30 @@ def load_dict(file_path):
         ) from e
 
 
-def get_diffusers_component_config(
-    model_path: str,
+def get_diffusers_config(
+    model: str,
 ) -> dict[str, Any]:
-    """Gets a configuration of a submodule for the given diffusers model.
+    """Gets a configuration for the given diffusers model.
 
     Args:
-        model_path: the path of the submodule (can be local path or HuggingFace model ID)
+        model: The model name or path.
 
     Returns:
         The loaded configuration.
     """
 
-    # Download from HuggingFace Hub if path doesn't exist locally
-    if not os.path.exists(model_path):
-        model_path = maybe_download_model(model_path)
-
-    # tokenizer
-    config_names = ["generation_config.json"]
-    # By default, we load config.json, but scheduler_config.json for scheduler
-    if "scheduler" in model_path:
-        config_names.append("scheduler_config.json")
+    config_name = "config.json"
+    if "scheduler" in model:
+        config_name = "scheduler_config.json"
+    # Check if the model path exists
+    if os.path.exists(model):
+        config_file = os.path.join(model, config_name)
+        config_dict = load_dict(config_file)
+        generation_config_file = os.path.join(model, "generation_config.json")
+        generation_config_dict = load_dict(generation_config_file)
+        return config_dict | generation_config_dict
     else:
-        config_names.append("config.json")
-
-    config_file_paths = [
-        os.path.join(model_path, config_name) for config_name in config_names
-    ]
-
-    combined_config = reduce(
-        lambda acc, path: acc | load_dict(path), config_file_paths, {}
-    )
-
-    return combined_config
+        raise RuntimeError(f"Diffusers config file not found at {model}")
 
 
 # Models don't use the same configuration key for determining the maximum
@@ -198,6 +187,18 @@ def check_gguf_file(model: str | os.PathLike) -> bool:
     return header == b"GGUF"
 
 
+def get_lock(model_name_or_path: str):
+    lock_dir = tempfile.gettempdir()
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    model_name = model_name_or_path.replace("/", "-")
+    hash_name = hashlib.sha256(model_name.encode()).hexdigest()
+    # add hash to avoid conflict with old users' lock files
+    lock_file_name = hash_name + model_name + ".lock"
+    # mode 0o666 is required for the filelock to be shared across users
+    lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
+    return lock
+
+
 def maybe_download_lora(
     model_name_or_path: str, local_dir: str | None = None, download: bool = True
 ) -> str:
@@ -213,10 +214,6 @@ def maybe_download_lora(
     """
 
     local_path = maybe_download_model(model_name_or_path, local_dir, download)
-    # return directly if local_path is a file
-    if os.path.isfile(local_path):
-        return local_path
-
     weight_name = _best_guess_weight_name(
         model_name_or_path, file_extension=".safetensors"
     )
@@ -376,16 +373,15 @@ def maybe_download_model(
         logger.info(
             "Downloading model snapshot from HF Hub for %s...", model_name_or_path
         )
-        with (
-            suppress_other_loggers(not_suppress_on_main_rank=False),
-            get_lock(model_name_or_path).acquire(poll_interval=2),
-        ):
+        with get_lock(model_name_or_path).acquire(
+            poll_interval=2
+        ), suppress_other_loggers(not_suppress_on_main_rank=True):
             local_path = snapshot_download(
                 repo_id=model_name_or_path,
                 ignore_patterns=["*.onnx", "*.msgpack"],
                 local_dir=local_dir,
             )
-            logger.info("Downloaded model to %s", local_path)
+        logger.info("Downloaded model to %s", local_path)
         return str(local_path)
     except Exception as e:
         raise ValueError(

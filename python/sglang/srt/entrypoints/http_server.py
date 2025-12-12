@@ -72,15 +72,12 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
-from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    CheckWeightsReqInput,
     CloseSessionReqInput,
     ConfigureLoggingReq,
-    ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
@@ -90,7 +87,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
-    PauseGenerationReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -122,12 +118,12 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
-    add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
+from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -144,15 +140,6 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
-    # Dict{
-    #   rank: Tuple(
-    #           session_id,
-    #           Dict{
-    #               name: Tuple (d_ptr, numel, element_size)
-    #           }
-    #         )
-    # }
-    remote_instance_transfer_engine_info: Optional[Dict] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -434,7 +421,7 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=503)
 
     if (
-        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
         and request.url.path == "/health"
     ):
         return Response(status_code=200)
@@ -507,17 +494,14 @@ async def get_model_info():
 @app.get("/model_info")
 async def model_info():
     """Get the model information."""
-    model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
-        "has_image_understanding": model_config.is_image_understandable_model,
-        "has_audio_understanding": model_config.is_audio_understandable_model,
-        "model_type": getattr(model_config.hf_config, "model_type", None),
-        "architectures": getattr(model_config.hf_config, "architectures", None),
+        "has_image_understanding": _global_state.tokenizer_manager.model_config.is_image_understandable_model,
+        "has_audio_understanding": _global_state.tokenizer_manager.model_config.is_audio_understandable_model,
     }
     return result
 
@@ -705,8 +689,6 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         record_shapes=obj.record_shapes,
         profile_by_stage=obj.profile_by_stage,
         merge_profiles=obj.merge_profiles,
-        profile_prefix=obj.profile_prefix,
-        profile_stages=obj.profile_stages,
     )
     return Response(
         content="Start profiling.\n",
@@ -820,24 +802,6 @@ async def send_weights_to_remote_instance(
         return ORJSONResponse(content, status_code=200)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
-
-
-@app.get("/get_remote_instance_transfer_engine_info")
-async def get_remote_instance_transfer_engine_info(rank: int = None):
-    if rank is None or rank < 0:
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
-
-    try:
-        result = {
-            "rank": rank,
-            "remote_instance_transfer_engine_info": _global_state.remote_instance_transfer_engine_info[
-                rank
-            ],
-        }
-        return result
-    except Exception as e:
-        logger.error(f"Exception: {e}")
-        return Response(status_code=HTTPStatus.BAD_REQUEST)
 
 
 @app.post("/init_weights_update_group")
@@ -989,15 +953,6 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.post("/weights_checker")
-async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
-    return ORJSONResponse(
-        {"success": success, "message": message},
-        status_code=200 if success else HTTPStatus.BAD_REQUEST,
-    )
-
-
 @app.api_route("/slow_down", methods=["GET", "POST"])
 async def slow_down(obj: SlowDownReqInput, request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
@@ -1131,9 +1086,9 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
 
 
 @app.post("/pause_generation")
-async def pause_generation(obj: PauseGenerationReqInput, request: Request):
+async def pause_generation(request: Request):
     """Pause generation."""
-    await _global_state.tokenizer_manager.pause_generation(obj)
+    await _global_state.tokenizer_manager.pause_generation()
     return ORJSONResponse(
         content={"message": "Generation paused successfully.", "status": "ok"},
         status_code=200,
@@ -1141,9 +1096,9 @@ async def pause_generation(obj: PauseGenerationReqInput, request: Request):
 
 
 @app.post("/continue_generation")
-async def continue_generation(obj: ContinueGenerationReqInput, request: Request):
+async def continue_generation(request: Request):
     """Continue generation."""
-    await _global_state.tokenizer_manager.continue_generation(obj)
+    await _global_state.tokenizer_manager.continue_generation()
     return ORJSONResponse(
         content={"message": "Generation continued successfully.", "status": "ok"},
         status_code=200,
@@ -1413,25 +1368,17 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
-    (
-        tokenizer_manager,
-        template_manager,
-        scheduler_info,
-        port_args,
-        remote_instance_transfer_engine_info,
-    ) = _launch_subprocesses(server_args=server_args)
+    tokenizer_manager, template_manager, scheduler_info, port_args = (
+        _launch_subprocesses(server_args=server_args)
+    )
 
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_info,
-            remote_instance_transfer_engine_info=remote_instance_transfer_engine_info,
         )
     )
-
-    if server_args.enable_metrics:
-        add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
@@ -1597,6 +1544,7 @@ def _execute_server_warmup(
     try:
         warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
         if server_args.disaggregation_mode == "null":
+            logger.info(f"Start of co-locate warmup ...")
             res = requests.post(
                 url + request_name,
                 json=json_data,

@@ -1,6 +1,6 @@
-# Install SGLang-diffusion
+# Install sgl-diffusion
 
-You can install sglang-diffusion using one of the methods below.
+You can install sgl-diffusion using one of the methods below.
 
 This page primarily applies to common NVIDIA GPU platforms.
 

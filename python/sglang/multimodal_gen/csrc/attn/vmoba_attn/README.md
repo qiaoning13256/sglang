@@ -1,4 +1,4 @@
-# Attention Kernel Used in SGLang diffusion
+# Attention Kernel Used in sgl-diffusion
 
 ## VMoBA: Mixture-of-Block Attention for Video Diffusion Models (VMoBA)
 

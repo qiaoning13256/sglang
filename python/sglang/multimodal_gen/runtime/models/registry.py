@@ -102,7 +102,7 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
     return discovered_models
 
 
-_SGLANG_DIFFUSION_MODELS = _discover_and_register_models()
+_SGL_DIFFUSION_MODELS = _discover_and_register_models()
 
 _SUBPROCESS_COMMAND = [
     sys.executable,
@@ -237,10 +237,10 @@ def _try_inspect_model_cls(
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
-    registered_models: dict[str, _BaseRegisteredModel] = field(default_factory=dict)
+    models: dict[str, _BaseRegisteredModel] = field(default_factory=dict)
 
     def get_supported_archs(self) -> Set[str]:
-        return self.registered_models.keys()
+        return self.models.keys()
 
     def register_model(
         self,
@@ -258,7 +258,7 @@ class _ModelRegistry:
           when importing the model and thus the related error
           :code:`RuntimeError: Cannot re-initialize CUDA in forked subprocess`.
         """
-        if model_arch in self.registered_models:
+        if model_arch in self.models:
             logger.warning(
                 "Model architecture %s is already registered, and will be "
                 "overwritten by the new model class %s.",
@@ -276,7 +276,7 @@ class _ModelRegistry:
         else:
             model = _RegisteredModel.from_model_cls(model_cls)
 
-        self.registered_models[model_arch] = model
+        self.models[model_arch] = model
 
     def _raise_for_unsupported(self, architectures: list[str]) -> NoReturn:
         all_supported_archs = self.get_supported_archs()
@@ -293,16 +293,16 @@ class _ModelRegistry:
         )
 
     def _try_load_model_cls(self, model_arch: str) -> type[nn.Module] | None:
-        if model_arch not in self.registered_models:
+        if model_arch not in self.models:
             return None
 
-        return _try_load_model_cls(model_arch, self.registered_models[model_arch])
+        return _try_load_model_cls(model_arch, self.models[model_arch])
 
     def _try_inspect_model_cls(self, model_arch: str) -> _ModelInfo | None:
-        if model_arch not in self.registered_models:
+        if model_arch not in self.models:
             return None
 
-        return _try_inspect_model_cls(model_arch, self.registered_models[model_arch])
+        return _try_inspect_model_cls(model_arch, self.models[model_arch])
 
     def _normalize_archs(
         self,
@@ -314,12 +314,13 @@ class _ModelRegistry:
             logger.warning("No model architectures are specified")
 
         normalized_arch = []
-        for arch in architectures:
-            if arch not in self.registered_models:
+        for model in architectures:
+            if model not in self.models:
                 raise Exception(
-                    f"Unsupported model architecture: {arch}. Registered architectures: {self.registered_models=}"
+                    f"Unsupported model architecture: {model}. Registered architectures: {architectures}"
                 )
-            normalized_arch.append(arch)
+                model = "TransformersModel"
+            normalized_arch.append(model)
         return normalized_arch
 
     def inspect_model_cls(
@@ -360,6 +361,6 @@ ModelRegistry = _ModelRegistry(
             component_name,
             mod_relname,
             cls_name,
-        ) in _SGLANG_DIFFUSION_MODELS.items()
+        ) in _SGL_DIFFUSION_MODELS.items()
     }
 )

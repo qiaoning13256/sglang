@@ -32,6 +32,7 @@ def get_param_names_mapping(
 
     Args:
         mapping_dict (Dict[str, str]): Dictionary mapping regex patterns to replacement patterns
+        param_name (str): The parameter name to be transformed
 
     Returns:
         Callable[[str], str]: A function that maps parameter names from source to target format
@@ -43,13 +44,13 @@ def get_param_names_mapping(
             match = re.match(pattern, name)
             if match:
                 merge_index = None
-                total_split_params = None
+                total_splitted_params = None
                 if isinstance(replacement, tuple):
                     merge_index = replacement[1]
-                    total_split_params = replacement[2]
+                    total_splitted_params = replacement[2]
                     replacement = replacement[0]
                 name = re.sub(pattern, replacement, name)
-                return name, merge_index, total_split_params
+                return name, merge_index, total_splitted_params
 
         # If no pattern matches, return the original name
         return name, None, None

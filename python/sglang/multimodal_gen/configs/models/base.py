@@ -46,7 +46,7 @@ class ModelConfig:
     # Diffuser/Transformer parameters
     arch_config: ArchConfig = field(default_factory=ArchConfig)
 
-    # sglang-diffusion-specific parameters here
+    # sgl-diffusion-specific parameters here
     # i.e. STA, quantization, teacache
 
     def __getattr__(self, name):

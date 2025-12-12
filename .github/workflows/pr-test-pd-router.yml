@@ -6,14 +6,13 @@ on:
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
-      - 'sgl-model-gateway/**'
+      - 'sgl-router/**'
   pull_request:
     branches: [ main ]
-    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
-      - 'sgl-model-gateway/**'
+      - 'sgl-router/**'
   workflow_dispatch:
 
 concurrency:
@@ -27,11 +26,7 @@ permissions:
 
 jobs:
   test-disaggregation:
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci' && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'router-benchmark' && contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark'))
     runs-on: [8-gpu-h200-oracle]
     timeout-minutes: 45
 
@@ -58,8 +53,8 @@ jobs:
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
-          sgl-model-gateway/target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-model-gateway/Cargo.lock') }}
+          sgl-router/target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
 
@@ -142,16 +137,16 @@ jobs:
       run: |
         echo "Installing SGLang with all extras..."
         python3 -m pip --no-cache-dir install --upgrade pip
-        python3 -m pip --no-cache-dir install torch==2.9.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
+        python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.7.post2
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
 
-    - name: Build and install sgl-model-gateway
+    - name: Build and install sgl-router
       run: |
         source "$HOME/.cargo/env"
-        echo "Building sgl-model-gateway..."
-        cd sgl-model-gateway/bindings/python
+        echo "Building sgl-router..."
+        cd sgl-router/bindings/python
         pip install maturin
         maturin build --release --out dist --features vendored-openssl
         pip install --force-reinstall dist/*.whl

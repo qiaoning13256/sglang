@@ -153,8 +153,6 @@ class TritonRunnerCore(MoeRunnerCore):
         routed_scaling_factor = self.config.routed_scaling_factor
         apply_router_weight_on_input = self.config.apply_router_weight_on_input
 
-        assert self.config.is_gated, "Only gated MoEs are supported for Triton runner"
-
         M = hidden_states.shape[0]
         E, N, _ = w13.shape
         compute_type = (
@@ -379,10 +377,7 @@ def pre_permute_standard_to_triton(
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-    hidden_states, topk_output = (
-        dispatch_output.hidden_states,
-        dispatch_output.topk_output,
-    )
+    hidden_states, topk_output = dispatch_output
 
     assert TopKOutputChecker.format_is_standard(topk_output)
 
@@ -417,7 +412,6 @@ def pre_permute_standard_to_triton(
         topk_output.topk_ids.shape[1],
         config_dtype,
         block_shape=quant_info.block_shape,
-        per_channel_quant=quant_info.per_channel_quant,
     )
 
     config = get_config_func(num_tokens)

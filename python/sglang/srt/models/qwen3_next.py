@@ -5,7 +5,6 @@ from typing import Any, Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import divide, get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -54,12 +53,8 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
-
 import triton
 import triton.language as tl
-
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils import direct_register_custom_op
 
 
 @triton.jit
@@ -354,11 +349,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
-            DUAL_STREAM_TOKEN_THRESHOLD = 0
-        else:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
-
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024 if not _is_npu else 0
         seq_len, _ = hidden_states.shape
         if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
             current_stream = torch.cuda.current_stream()
@@ -373,22 +364,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         return projected_states_qkvz, projected_states_ba
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        output = torch.empty_like(hidden_states)
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            torch.ops.sglang.gdn_with_output(
-                hidden_states,
-                output,
-                self.layer_id,
-            )
-            return output
-        else:
-            return self._forward(hidden_states, forward_batch)
-
-    def _forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -492,7 +467,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
-        is_next_layer_sparse = True
         self.layer_id = layer_id
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -500,7 +474,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -649,14 +622,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         # Qwen3Next all layers are sparse and have no nextn now
         self.is_layer_sparse = True
         is_previous_layer_sparse = True
-        is_next_layer_sparse = True
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         if self.is_layer_sparse:
@@ -893,6 +864,7 @@ class Qwen3NextForCausalLM(nn.Module):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
+        self.lm_head = self.lm_head.float()
         self.logits_processor = LogitsProcessor(config)
 
         self._routed_experts_weights_of_layer = LazyValue(
@@ -1052,39 +1024,3 @@ class Qwen3NextForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3NextForCausalLM
-
-
-def gdn_with_output(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-
-    ret = attention_layer._forward(hidden_states, forward_batch)
-
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
-    return
-
-
-def gdn_with_output_fake(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="gdn_with_output",
-    op_func=gdn_with_output,
-    mutates_args=["output"],
-    fake_impl=gdn_with_output_fake,
-)

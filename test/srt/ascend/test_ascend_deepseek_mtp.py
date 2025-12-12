@@ -33,7 +33,7 @@ class TestAscendDeepSeekMTP(CustomTestCase):
             "--attention-backend",
             "ascend",
             "--quantization",
-            "modelslim",
+            "w8a8_int8",
             "--mem-fraction-static",
             0.8,
             "--disable-radix-cache",

@@ -43,7 +43,7 @@ if _is_cuda:
         ggml_mul_mat_vec_a8,
     )
 else:
-    warnings.warn(f"Only CUDA support GGUF quantization currently.")
+    warnings.warn(f"Only CUDA support GGUF q uantization currently.")
 
 logger = logging.getLogger(__name__)
 

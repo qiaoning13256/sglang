@@ -8,9 +8,7 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.server_fixtures.disaggregation_fixture import (
-    PDDisaggregationServerBase,
-)
+from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -20,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDisaggregationAccuracy(PDDisaggregationServerBase):
+class TestDisaggregationAccuracy(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -187,7 +185,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
         )
 
 
-class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
+class TestDisaggregationMooncakeFailure(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -275,7 +273,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
                 raise e from health_check_error
 
 
-class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
+class TestDisaggregationMooncakeSpec(TestDisaggregationBase):
 
     @classmethod
     def setUpClass(cls):
@@ -360,7 +358,7 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
         self.assertGreater(metrics["accuracy"], 0.20)
 
 
-class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
+class TestDisaggregationSimulatedRetract(TestDisaggregationBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
