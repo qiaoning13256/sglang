@@ -76,6 +76,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
+    numa_utils,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -126,19 +127,27 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info, port_args = (
-            _launch_subprocesses(server_args=server_args)
-        )
+        (
+            tokenizer_manager,
+            template_manager,
+            scheduler_info,
+            port_args,
+            remote_instance_transfer_engine_info,
+        ) = _launch_subprocesses(server_args=server_args)
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
         self.port_args = port_args
+        self.remote_instance_transfer_engine_info = remote_instance_transfer_engine_info
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
-        self.send_to_rpc = get_zmq_socket(
-            context, zmq.DEALER, self.port_args.rpc_ipc_name, True
-        )
+        if self.server_args.node_rank == 0:
+            self.send_to_rpc = get_zmq_socket(
+                context, zmq.DEALER, self.port_args.rpc_ipc_name, True
+            )
+        else:
+            self.send_to_rpc = None
 
         # Enable tracing
         if server_args.enable_trace:
@@ -463,6 +472,7 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
+        load_format: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -471,6 +481,7 @@ class Engine(EngineBase):
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
+            load_format=load_format,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -530,8 +541,7 @@ class Engine(EngineBase):
             zmq_handles=zmq_handles,
             flush_cache=flush_cache,
         )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_ipc(obj, None)
         )
 
@@ -724,7 +734,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.5.2",
+            "0.5.3",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -732,7 +742,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.17.post1",
+            "0.3.19",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
@@ -777,14 +787,14 @@ def _init_tokenizer_manager(
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+) -> Tuple[TokenizerManager, TemplateManager, Dict, PortArgs]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """
     # Configure global environment
     configure_logger(server_args)
-    server_args.check_server_args()
     _set_envs_and_config(server_args)
+    server_args.check_server_args()
 
     # Allocate ports for inter-process communications
     if port_args is None:
@@ -842,7 +852,9 @@ def _launch_subprocesses(
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess():
+                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                        server_args, gpu_id
+                    ):
                         proc.start()
 
                 scheduler_procs.append(proc)
@@ -903,6 +915,7 @@ def _launch_subprocesses(
 
     # Wait for the model to finish loading
     scheduler_infos = []
+    remote_instance_transfer_engine_info = {}
     for i in range(len(scheduler_pipe_readers)):
         try:
             data = scheduler_pipe_readers[i].recv()
@@ -919,9 +932,24 @@ def _launch_subprocesses(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_infos.append(data)
+        if (
+            "tp_rank" in data
+            and "remote_instance_transfer_engine_session_id" in data
+            and "remote_instance_transfer_engine_weights_info_dict" in data
+        ):
+            remote_instance_transfer_engine_info[data["tp_rank"]] = (
+                data["remote_instance_transfer_engine_session_id"],
+                data["remote_instance_transfer_engine_weights_info_dict"],
+            )
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
-    return tokenizer_manager, template_manager, scheduler_info, port_args
+    return (
+        tokenizer_manager,
+        template_manager,
+        scheduler_info,
+        port_args,
+        remote_instance_transfer_engine_info,
+    )
